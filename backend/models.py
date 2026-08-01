@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text, Enum as SQLEnum, Boolean, Index
 from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime
@@ -44,6 +44,15 @@ class TaskPriority(str, enum.Enum):
     URGENT = "urgent"
 
 
+class TimeEntryStatus(str, enum.Enum):
+    """BTT status literals, verbatim per PRD ch.0.7"""
+    DRAFT = "draft"
+    SUBMITTED = "submitted"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    WRITTEN_OFF = "written_off"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -59,6 +68,7 @@ class User(Base):
     projects = relationship("Project", back_populates="owner")
     invoices = relationship("Invoice", back_populates="owner")
     activities = relationship("Activity", back_populates="user")
+    time_entries = relationship("TimeEntry", back_populates="owner")
 
 
 class Client(Base):
@@ -191,3 +201,33 @@ class Activity(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
 
     user = relationship("User", back_populates="activities")
+
+
+class TimeEntry(Base):
+    """BTT ledger entry (PRD NX-PRD-BTT-2026-08 ch.3.1). Independent from Task."""
+
+    __tablename__ = "time_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    work_date = Column(String(10), nullable=False)  # YYYY-MM-DD
+    duration_minutes = Column(Integer, nullable=False)  # > 0, enforced in schema/API
+    description = Column(Text, nullable=False)
+    billable = Column(Boolean, default=True, nullable=False)
+    hourly_rate_cents = Column(Integer, nullable=True)  # integer cents, >= 0
+    status = Column(SQLEnum(TimeEntryStatus), default=TimeEntryStatus.DRAFT, nullable=False)
+    reject_reason = Column(Text, nullable=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True)  # set by M3 write-off
+    written_off_at = Column(DateTime, nullable=True)  # set by M3 write-off
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    owner = relationship("User", back_populates="time_entries")
+    project = relationship("Project", backref="time_entries")
+    invoice = relationship("Invoice", backref="time_entries")
+
+    __table_args__ = (
+        Index("ix_time_entries_owner_workdate", "owner_id", "work_date"),
+        Index("ix_time_entries_project_status", "project_id", "status"),
+    )

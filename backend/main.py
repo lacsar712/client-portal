@@ -11,6 +11,8 @@ import random
 from database import engine, get_db, Base
 from config import settings
 from seed import seed_database
+from time_entries import router as time_entries_router
+from invoice_utils import calculate_invoice_totals as _calculate_invoice_totals
 import models
 import schemas
 from auth import (
@@ -47,6 +49,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# BTT module: /api/time-entries* (PRD NX-PRD-BTT-2026-08)
+app.include_router(time_entries_router)
 
 # Helper function to log activity
 def log_activity(db: Session, user_id: int, action: str, entity_type: str, entity_name: str, details: str = None):
@@ -514,24 +519,9 @@ def _update_project_progress(db: Session, project: models.Project):
 
 # ==================== INVOICE ROUTES ====================
 
-def _calculate_invoice_totals(invoice: models.Invoice, db: Session):
-    """Calculate invoice totals based on items"""
-    items = db.query(models.InvoiceItem).filter(models.InvoiceItem.invoice_id == invoice.id).all()
-
-    subtotal = sum(item.amount for item in items)
-    discount_amount = subtotal * (invoice.discount_percent / 100) if invoice.discount_percent else 0
-    taxable_amount = subtotal - discount_amount
-    tax_amount = taxable_amount * (invoice.tax_rate / 100) if invoice.tax_rate else 0
-    total = taxable_amount + tax_amount
-    amount_due = total - invoice.amount_paid
-
-    invoice.subtotal = round(subtotal, 2)
-    invoice.discount_amount = round(discount_amount, 2)
-    invoice.tax_amount = round(tax_amount, 2)
-    invoice.total = round(total, 2)
-    invoice.amount_due = round(amount_due, 2)
-
-    db.commit()
+# NOTE: totals recalculation lives in invoice_utils.calculate_invoice_totals
+# (imported above as _calculate_invoice_totals) so the BTT write-off router
+# shares the same implementation.
 
 def _get_invoice_response(invoice: models.Invoice, db: Session) -> schemas.InvoiceResponse:
     """Build invoice response with related data"""
@@ -1101,6 +1091,28 @@ def seed_data(db: Session = Depends(get_db), current_user: models.User = Depends
             created_at=datetime.now() - timedelta(hours=i*2)
         )
         db.add(activity)
+
+    db.commit()
+
+    # Create sample time entries for the BTT module (PRD ch.7.1, optional demo data)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    time_entries_data = [
+        {"project_id": created_projects[0].id, "work_date": today_str, "duration_minutes": 90,
+         "description": "Backend API development for checkout flow", "billable": True,
+         "hourly_rate_cents": 15000, "status": models.TimeEntryStatus.DRAFT},
+        {"project_id": created_projects[0].id, "work_date": today_str, "duration_minutes": 60,
+         "description": "Code review and merge request cleanup", "billable": True,
+         "hourly_rate_cents": 15000, "status": models.TimeEntryStatus.SUBMITTED},
+        {"project_id": created_projects[1].id, "work_date": yesterday_str, "duration_minutes": 120,
+         "description": "High-fidelity mockups iteration", "billable": True,
+         "hourly_rate_cents": 15000, "status": models.TimeEntryStatus.APPROVED},
+        {"project_id": created_projects[1].id, "work_date": yesterday_str, "duration_minutes": 45,
+         "description": "Internal team sync", "billable": False,
+         "hourly_rate_cents": None, "status": models.TimeEntryStatus.DRAFT},
+    ]
+    for entry_data in time_entries_data:
+        db.add(models.TimeEntry(**entry_data, owner_id=current_user.id))
 
     db.commit()
 
