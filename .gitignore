@@ -1,0 +1,97 @@
+############################
+# General
+############################
+.DS_Store
+Thumbs.db
+.env
+.env.*
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+.claude/**
+############################
+# Node / React
+############################
+node_modules/
+dist/
+build/
+.next/
+out/
+coverage/
+.eslintcache
+.vscode/
+.idea/
+*.tsbuildinfo
+
+############################
+# Vite / CRA
+############################
+.vite/
+.cache/
+
+############################
+# Python / FastAPI
+############################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+*.egg
+
+############################
+# FastAPI / Uvicorn / Gunicorn
+############################
+logs/
+*.log
+uvicorn.log
+gunicorn.log
+
+############################
+# Pytest / Coverage
+############################
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+############################
+# Mypy / Ruff / Black
+############################
+.mypy_cache/
+.ruff_cache/
+.black/
+
+############################
+# Poetry
+############################
+poetry.lock
+
+############################
+# Docker
+############################
+docker-compose.override.yml
+
+############################
+# Database
+############################
+*.sqlite3
+*.db
+
+############################
+# OS / Editors
+############################
+.vscode/
+.idea/
+*.swp
