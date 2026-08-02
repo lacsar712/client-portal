@@ -1,8 +1,20 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, ForeignKey, Text, Boolean, Enum as SQLEnum, Index
 from sqlalchemy.orm import relationship
 from database import Base
-from datetime import datetime
+from datetime import datetime, date
 import enum
+
+
+BTT_MAX_MINUTES_PER_DAY = 1440
+BTT_DESC_MAX = 500
+
+
+class TimeEntryStatus(str, enum.Enum):
+    DRAFT = "draft"
+    SUBMITTED = "submitted"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    WRITTEN_OFF = "written_off"
 
 
 class ProjectStatus(str, enum.Enum):
@@ -59,6 +71,7 @@ class User(Base):
     projects = relationship("Project", back_populates="owner")
     invoices = relationship("Invoice", back_populates="owner")
     activities = relationship("Activity", back_populates="user")
+    time_entries = relationship("TimeEntry", back_populates="owner")
 
 
 class Client(Base):
@@ -191,3 +204,30 @@ class Activity(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
 
     user = relationship("User", back_populates="activities")
+
+
+class TimeEntry(Base):
+    __tablename__ = "time_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    work_date = Column(Date, nullable=False, index=True)
+    duration_minutes = Column(Integer, nullable=False)
+    description = Column(Text, nullable=False)
+    billable = Column(Boolean, default=True, nullable=False)
+    hourly_rate_cents = Column(Integer, nullable=True)
+    status = Column(SQLEnum(TimeEntryStatus), default=TimeEntryStatus.DRAFT, nullable=False, index=True)
+    reject_reason = Column(Text, nullable=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True)
+    written_off_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    owner = relationship("User", back_populates="time_entries")
+    project = relationship("Project", backref="time_entries")
+
+    __table_args__ = (
+        Index("ix_time_entries_owner_date", "owner_id", "work_date"),
+        Index("ix_time_entries_project_status", "project_id", "status"),
+    )
