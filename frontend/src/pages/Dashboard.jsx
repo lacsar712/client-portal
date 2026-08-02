@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -7,9 +8,11 @@ import {
 import {
   DollarSign, Clock, FolderKanban, Users,
   TrendingUp, TrendingDown, ArrowUpRight, Activity,
-  Zap, FileText
+  Zap, FileText, Timer
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { getTimeEntriesStatsSummary } from '../services/timeEntriesApi';
+import { formatCents } from '../utils/bttMoney';
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -26,11 +29,14 @@ const itemVariants = {
 
 export default function Dashboard() {
   const { api } = useAuth();
+  const navigate = useNavigate();
   const [stats, setStats] = useState(null);
+  const [bttStats, setBttStats] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     fetchDashboard();
+    fetchBttSummary();
   }, []);
 
   const fetchDashboard = async () => {
@@ -41,6 +47,15 @@ export default function Dashboard() {
       console.error('Failed to fetch dashboard:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const fetchBttSummary = async () => {
+    try {
+      const data = await getTimeEntriesStatsSummary();
+      setBttStats(data);
+    } catch (err) {
+      console.error('Failed to fetch billable time summary:', err);
     }
   };
 
@@ -146,6 +161,41 @@ export default function Dashboard() {
               );
             })}
           </div>
+
+          {/* Billable Time card (BTT module, PRD ch.9) */}
+          <motion.div
+            variants={itemVariants}
+            className="card"
+            style={{ marginBottom: '1.5rem', cursor: 'pointer' }}
+            onClick={() => navigate('/time-entries?status=approved')}
+            title="View approved time entries"
+          >
+            <div className="card-header">
+              <h3 className="card-title">Billable Time</h3>
+              <Timer size={20} style={{ color: 'var(--text-muted)' }} />
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
+              <div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>
+                  Approved not written-off (this week)
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 700 }}>
+                  {bttStats?.week_approved_unwritten_minutes ?? 0} min
+                </div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                  {((bttStats?.week_approved_unwritten_minutes ?? 0) / 60).toFixed(2)} hours
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>
+                  Written-off amount (this month)
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--accent-primary)' }}>
+                  {formatCents(bttStats?.month_written_off_amount_cents ?? 0)}
+                </div>
+              </div>
+            </div>
+          </motion.div>
 
           {/* Charts Row */}
           <div className="grid-2" style={{ marginBottom: '1.5rem' }}>

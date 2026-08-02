@@ -9,7 +9,8 @@ import {
   LogOut,
   Moon,
   Sun,
-  Sparkles
+  Sparkles,
+  Clock
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
@@ -19,6 +20,7 @@ const navItems = [
   { path: '/projects', icon: FolderKanban, label: 'Projects' },
   { path: '/clients', icon: Users, label: 'Clients' },
   { path: '/invoices', icon: FileText, label: 'Invoices' },
+  { path: '/time-entries', icon: Clock, label: 'Time Tracking', nav: 'time-tracking' },
 ];
 
 export default function Sidebar() {
@@ -85,7 +87,7 @@ export default function Sidebar() {
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.375rem' }}>
           {navItems.map((item, index) => {
-            const isActive = location.pathname === item.path;
+            const isActive = location.pathname === item.path || location.pathname.startsWith(`${item.path}/`);
             const Icon = item.icon;
 
             return (
@@ -97,6 +99,7 @@ export default function Sidebar() {
               >
                 <NavLink
                   to={item.path}
+                  data-nav={item.nav}
                   style={{
                     display: 'flex',
                     alignItems: 'center',

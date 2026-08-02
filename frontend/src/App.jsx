@@ -7,6 +7,8 @@ import Dashboard from './pages/Dashboard';
 import Projects from './pages/Projects';
 import Clients from './pages/Clients';
 import Invoices from './pages/Invoices';
+import TimeEntries from './pages/TimeEntries';
+import TimeEntriesWeek from './pages/TimeEntriesWeek';
 
 function ProtectedRoute() {
   const { user, loading } = useAuth();
@@ -80,6 +82,8 @@ export default function App() {
               <Route path="/projects" element={<Projects />} />
               <Route path="/clients" element={<Clients />} />
               <Route path="/invoices" element={<Invoices />} />
+              <Route path="/time-entries" element={<TimeEntries />} />
+              <Route path="/time-entries/week" element={<TimeEntriesWeek />} />
             </Route>
 
             {/* Default Redirect */}
