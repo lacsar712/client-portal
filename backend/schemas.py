@@ -1,7 +1,7 @@
 from pydantic import BaseModel, EmailStr
 from datetime import datetime
 from typing import Optional, List
-from models import ProjectStatus, InvoiceStatus, TaskStatus, TaskPriority, PaymentTerms
+from models import ProjectStatus, InvoiceStatus, TaskStatus, TaskPriority, PaymentTerms, TimeEntryStatus
 
 # Auth Schemas
 class UserCreate(BaseModel):
@@ -257,3 +257,82 @@ class DashboardStats(BaseModel):
     monthly_revenue: List[dict]
     project_status_distribution: List[dict]
     recent_activities: List[ActivityResponse]
+
+# ==================== Time Entry Schemas (BTT) ====================
+
+class TimeEntryCreate(BaseModel):
+    """Payload for creating a draft time entry (PRD 5.1).
+
+    Fields: project_id (owned by user), work_date (YYYY-MM-DD), duration_minutes
+    (>0), description (1..500 after trim), optional billable (default True) and
+    hourly_rate_cents (integer cents, >= 0). Validation of value ranges and the
+    daily 1440-minute cap happens in the route layer so proper BTT error codes
+    can be returned.
+    """
+    project_id: int
+    work_date: str
+    duration_minutes: int
+    description: str
+    billable: Optional[bool] = True
+    hourly_rate_cents: Optional[int] = None
+
+class TimeEntryUpdate(BaseModel):
+    """Payload for editing a draft time entry (PRD 4.3 — draft only).
+
+    All fields optional; only supplied fields are updated. Non-draft edits are
+    rejected in the route layer with BTT_E004.
+    """
+    project_id: Optional[int] = None
+    work_date: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    description: Optional[str] = None
+    billable: Optional[bool] = None
+    hourly_rate_cents: Optional[int] = None
+
+class TimeEntryTransition(BaseModel):
+    """Payload for a state-machine transition (PRD 5.1.6).
+
+    `to_status` must be a legal target (never `written_off` — that uses the
+    dedicated write-off endpoint). `reject_reason` is optional and only stored
+    when transitioning to `rejected`.
+    """
+    to_status: TimeEntryStatus
+    reject_reason: Optional[str] = None
+
+class TimeEntryWriteOff(BaseModel):
+    """Payload for writing off an approved billable entry to an invoice (M3)."""
+    invoice_id: int
+
+class TimeEntryStatsSummary(BaseModel):
+    """Billable-time dashboard metrics (PRD 5.3.9 / chapter 9).
+
+    Attributes:
+        week_approved_unwritten_minutes: Minutes of `approved` (not yet
+            written-off) entries dated this week (Monday..today).
+        month_written_off_amount_cents: Total written-off amount in integer
+            cents for entries written off during the current month.
+    """
+    week_approved_unwritten_minutes: int
+    month_written_off_amount_cents: int
+
+class TimeEntryResponse(BaseModel):
+    """Serialized time entry with derived read-only `amount_cents` (PRD 3.2)."""
+    id: int
+    owner_id: int
+    project_id: int
+    project_name: Optional[str] = None
+    work_date: str
+    duration_minutes: int
+    description: str
+    billable: bool
+    hourly_rate_cents: Optional[int]
+    status: str
+    reject_reason: Optional[str]
+    invoice_id: Optional[int]
+    written_off_at: Optional[datetime]
+    amount_cents: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True

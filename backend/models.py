@@ -1,8 +1,24 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, Index, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime
 import enum
+
+
+# ==================== BTT (Billable Time Tracking) constants ====================
+# Frozen global invariants per NX-PRD-BTT-2026-08 chapters 0 and 13.
+BTT_MAX_MINUTES_PER_DAY = 24 * 60  # 1440
+BTT_DESC_MAX = 500
+BTT_WARN_MINUTES_PER_DAY = 1200
+
+
+class TimeEntryStatus(str, enum.Enum):
+    """Time entry lifecycle states (PRD 0.7 / 13 — literal strings, do not rename)."""
+    DRAFT = "draft"
+    SUBMITTED = "submitted"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    WRITTEN_OFF = "written_off"
 
 
 class ProjectStatus(str, enum.Enum):
@@ -177,6 +193,41 @@ class InvoiceItem(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     invoice = relationship("Invoice", back_populates="items")
+
+
+class TimeEntry(Base):
+    """Billable time ledger row (BTT module, PRD chapter 3).
+
+    Money is stored as integer cents (`hourly_rate_cents`); duration is stored
+    as a positive integer `duration_minutes`. `status` uses the frozen literals
+    defined in `TimeEntryStatus` (PRD 0.7). This is an independent table and
+    must never be merged into `Task`.
+    """
+    __tablename__ = "time_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    work_date = Column(String, nullable=False)  # YYYY-MM-DD
+    duration_minutes = Column(Integer, nullable=False)
+    description = Column(Text, nullable=False)
+    billable = Column(Boolean, default=True)
+    hourly_rate_cents = Column(Integer, nullable=True)  # >= 0; must be > 0 to write off
+    status = Column(String, default=TimeEntryStatus.DRAFT.value, nullable=False, index=True)
+    reject_reason = Column(Text, nullable=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True)  # set on write-off (M3)
+    written_off_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    owner = relationship("User")
+    project = relationship("Project")
+    invoice = relationship("Invoice")
+
+
+# Recommended composite indexes (PRD 3.3).
+Index("ix_time_entries_owner_work_date", TimeEntry.owner_id, TimeEntry.work_date)
+Index("ix_time_entries_project_status", TimeEntry.project_id, TimeEntry.status)
 
 
 class Activity(Base):

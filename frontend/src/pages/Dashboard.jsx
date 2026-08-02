@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -10,6 +11,8 @@ import {
   Zap, FileText
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { fetchStatsSummary } from '../services/timeEntriesApi';
+import { formatCents, formatMinutes, minutesToHours } from '../utils/bttMoney';
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -26,11 +29,14 @@ const itemVariants = {
 
 export default function Dashboard() {
   const { api } = useAuth();
+  const navigate = useNavigate();
   const [stats, setStats] = useState(null);
+  const [bttStats, setBttStats] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     fetchDashboard();
+    fetchBillableTime();
   }, []);
 
   const fetchDashboard = async () => {
@@ -41,6 +47,14 @@ export default function Dashboard() {
       console.error('Failed to fetch dashboard:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const fetchBillableTime = async () => {
+    try {
+      setBttStats(await fetchStatsSummary());
+    } catch (err) {
+      console.error('Failed to fetch billable time stats:', err);
     }
   };
 
@@ -265,6 +279,46 @@ export default function Dashboard() {
               )}
             </motion.div>
           </div>
+
+          {/* Billable Time card (BTT, PRD chapter 9). Title is frozen. */}
+          <motion.div
+            variants={itemVariants}
+            className="card"
+            style={{ marginBottom: '1.5rem', cursor: 'pointer' }}
+            onClick={() => navigate('/time-entries?status=approved')}
+            role="button"
+            data-nav="billable-time"
+          >
+            <div className="card-header">
+              <h3 className="card-title">Billable Time</h3>
+              <Clock size={20} style={{ color: 'var(--accent-primary)' }} />
+            </div>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+              gap: '1rem'
+            }}>
+              <div>
+                <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', marginBottom: '0.375rem' }}>
+                  Approved not written-off (this week)
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 700 }}>
+                  {formatMinutes(bttStats?.week_approved_unwritten_minutes || 0)}
+                </div>
+                <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>
+                  {minutesToHours(bttStats?.week_approved_unwritten_minutes || 0)} h
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', marginBottom: '0.375rem' }}>
+                  Written-off amount (this month)
+                </div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--accent-primary)' }}>
+                  {formatCents(bttStats?.month_written_off_amount_cents || 0)}
+                </div>
+              </div>
+            </div>
+          </motion.div>
 
           {/* Activity Timeline */}
           <motion.div variants={itemVariants} className="card">
