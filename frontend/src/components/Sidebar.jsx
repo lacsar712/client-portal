@@ -5,6 +5,7 @@ import {
   FolderKanban,
   Users,
   FileText,
+  Clock,
   Settings,
   LogOut,
   Moon,
@@ -19,6 +20,7 @@ const navItems = [
   { path: '/projects', icon: FolderKanban, label: 'Projects' },
   { path: '/clients', icon: Users, label: 'Clients' },
   { path: '/invoices', icon: FileText, label: 'Invoices' },
+  { path: '/time-entries', icon: Clock, label: 'Time Tracking', nav: 'time-tracking' },
 ];
 
 export default function Sidebar() {
@@ -97,6 +99,7 @@ export default function Sidebar() {
               >
                 <NavLink
                   to={item.path}
+                  data-nav={item.nav}
                   style={{
                     display: 'flex',
                     alignItems: 'center',

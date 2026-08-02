@@ -4,8 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime, timedelta
-from typing import List
+from datetime import datetime, timedelta, date
+from typing import List, Optional
 import random
 
 from database import engine, get_db, Base
@@ -914,8 +914,494 @@ def delete_invoice_item(
 
     return {"message": "Item deleted successfully"}
 
-# ==================== DASHBOARD ROUTES ====================
+# ==================== TIME ENTRY ROUTES (BTT) ====================
+# Prefix: /api/time-entries (PRD chapter 5). All endpoints require the existing
+# JWT auth via get_current_user. Error codes follow PRD 0.9 / appendix F: the
+# HTTP detail is a dict {"code": "BTT_E00x", "message": "..."} so both the UI
+# and the evaluator can read `detail.code`.
 
+# Legal state-machine transitions (PRD 4.1). `written_off` is reached only via
+# the dedicated write-off endpoint (M3), never through the transition API.
+BTT_LEGAL_TRANSITIONS = {
+    (models.TimeEntryStatus.DRAFT.value, models.TimeEntryStatus.SUBMITTED.value),
+    (models.TimeEntryStatus.SUBMITTED.value, models.TimeEntryStatus.APPROVED.value),
+    (models.TimeEntryStatus.SUBMITTED.value, models.TimeEntryStatus.REJECTED.value),
+    (models.TimeEntryStatus.REJECTED.value, models.TimeEntryStatus.DRAFT.value),
+}
+
+# Fields that may only be edited while status == draft (PRD 4.3).
+BTT_EDITABLE_FIELDS = {
+    "project_id", "work_date", "duration_minutes",
+    "description", "billable", "hourly_rate_cents",
+}
+
+
+def _btt_error(status_code: int, code: str, message: str) -> HTTPException:
+    """Build an HTTPException carrying a BTT error code (PRD 0.9 / appendix F).
+
+    Args:
+        status_code: HTTP status code to return.
+        code: BTT error code string, e.g. "BTT_E002".
+        message: Human-readable message; also contains the code substring.
+
+    Returns:
+        HTTPException whose ``detail`` is ``{"code", "message"}``.
+    """
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": f"{code}: {message}"},
+    )
+
+
+def _btt_amount_cents(entry: models.TimeEntry) -> Optional[int]:
+    """Compute the derived, integer-only billable amount for an entry (PRD 3.2).
+
+    Args:
+        entry: The TimeEntry model instance.
+
+    Returns:
+        ``(duration_minutes * hourly_rate_cents) // 60`` as an int, or ``None``
+        when the entry is non-billable or has no hourly rate.
+    """
+    if not entry.billable or entry.hourly_rate_cents is None:
+        return None
+    return (entry.duration_minutes * entry.hourly_rate_cents) // 60
+
+
+def _btt_response(entry: models.TimeEntry, db: Session) -> schemas.TimeEntryResponse:
+    """Serialize a TimeEntry to its API response, resolving the project name.
+
+    Args:
+        entry: The TimeEntry model instance.
+        db: Active database session.
+
+    Returns:
+        A ``TimeEntryResponse`` including the derived ``amount_cents``.
+    """
+    project = db.query(models.Project).filter(models.Project.id == entry.project_id).first()
+    data = {k: v for k, v in entry.__dict__.items() if not k.startswith("_")}
+    return schemas.TimeEntryResponse(
+        **data,
+        project_name=project.name if project else None,
+        amount_cents=_btt_amount_cents(entry),
+    )
+
+
+def _btt_validate_duration(duration_minutes: int) -> None:
+    """Validate `duration_minutes` is a positive integer (BTT_E001)."""
+    if not isinstance(duration_minutes, int) or isinstance(duration_minutes, bool) or duration_minutes <= 0:
+        raise _btt_error(422, "BTT_E001", "duration_minutes must be a positive integer")
+
+
+def _btt_validate_description(description: str) -> str:
+    """Trim and validate description length is 1..BTT_DESC_MAX (BTT_E001)."""
+    trimmed = (description or "").strip()
+    if len(trimmed) < 1 or len(trimmed) > models.BTT_DESC_MAX:
+        raise _btt_error(
+            422, "BTT_E001",
+            f"description must be 1..{models.BTT_DESC_MAX} characters after trim",
+        )
+    return trimmed
+
+
+def _btt_get_owned_project(project_id: int, db: Session, current_user: models.User) -> models.Project:
+    """Fetch a project owned by the current user or raise BTT_E006."""
+    project = db.query(models.Project).filter(
+        models.Project.id == project_id,
+        models.Project.owner_id == current_user.id,
+    ).first()
+    if not project:
+        raise _btt_error(404, "BTT_E006", "Project not found or not owned by current user")
+    return project
+
+
+def _btt_assert_daily_cap(
+    db: Session,
+    current_user: models.User,
+    work_date: str,
+    added_minutes: int,
+    exclude_id: Optional[int] = None,
+) -> None:
+    """Enforce the 1440 min/day cap over non-rejected entries (PRD 0.8, BTT_E002).
+
+    Args:
+        db: Active database session.
+        current_user: Owner whose entries are summed.
+        work_date: The YYYY-MM-DD day being checked.
+        added_minutes: Minutes about to be added/changed for that day.
+        exclude_id: Optional entry id to exclude (when editing in place).
+
+    Raises:
+        HTTPException BTT_E002 if the day total would exceed 1440.
+    """
+    query = db.query(func.coalesce(func.sum(models.TimeEntry.duration_minutes), 0)).filter(
+        models.TimeEntry.owner_id == current_user.id,
+        models.TimeEntry.work_date == work_date,
+        models.TimeEntry.status != models.TimeEntryStatus.REJECTED.value,
+    )
+    if exclude_id is not None:
+        query = query.filter(models.TimeEntry.id != exclude_id)
+    existing = query.scalar() or 0
+    if existing + added_minutes > models.BTT_MAX_MINUTES_PER_DAY:
+        raise _btt_error(
+            422, "BTT_E002",
+            f"Daily limit of {models.BTT_MAX_MINUTES_PER_DAY} minutes exceeded",
+        )
+
+
+def _btt_parse_iso_monday(week_start: str):
+    """Parse `week_start` and require it to be an ISO Monday (PRD 10.1, BTT_E008).
+
+    Args:
+        week_start: A YYYY-MM-DD date string.
+
+    Returns:
+        The parsed ``date`` when it falls on a Monday.
+
+    Raises:
+        HTTPException BTT_E008 when the value is unparseable or not a Monday.
+    """
+    try:
+        parsed = date.fromisoformat(week_start)
+    except (ValueError, TypeError):
+        raise _btt_error(422, "BTT_E008", "week_start must be an ISO date (YYYY-MM-DD)")
+    # Python weekday(): Monday == 0.
+    if parsed.weekday() != 0:
+        raise _btt_error(422, "BTT_E008", "week_start must be an ISO Monday")
+    return parsed
+
+
+def _btt_get_owned_entry(entry_id: int, db: Session, current_user: models.User) -> models.TimeEntry:
+    """Fetch a time entry owned by the current user or raise 404."""
+    entry = db.query(models.TimeEntry).filter(
+        models.TimeEntry.id == entry_id,
+        models.TimeEntry.owner_id == current_user.id,
+    ).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Time entry not found")
+    return entry
+
+
+@app.post("/api/time-entries", response_model=schemas.TimeEntryResponse)
+def create_time_entry(
+    payload: schemas.TimeEntryCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _btt_validate_duration(payload.duration_minutes)
+    description = _btt_validate_description(payload.description)
+    _btt_get_owned_project(payload.project_id, db, current_user)
+    if payload.hourly_rate_cents is not None and payload.hourly_rate_cents < 0:
+        raise _btt_error(422, "BTT_E007", "hourly_rate_cents must be >= 0")
+    _btt_assert_daily_cap(db, current_user, payload.work_date, payload.duration_minutes)
+
+    entry = models.TimeEntry(
+        owner_id=current_user.id,
+        project_id=payload.project_id,
+        work_date=payload.work_date,
+        duration_minutes=payload.duration_minutes,
+        description=description,
+        billable=payload.billable if payload.billable is not None else True,
+        hourly_rate_cents=payload.hourly_rate_cents,
+        status=models.TimeEntryStatus.DRAFT.value,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    import logging
+    logging.info("btt_entry_created id=%s owner=%s", entry.id, current_user.id)
+    log_activity(db, current_user.id, "created", "time_entry", f"Entry #{entry.id}")
+
+    return _btt_response(entry, db)
+
+
+@app.get("/api/time-entries", response_model=List[schemas.TimeEntryResponse])
+def list_time_entries(
+    project_id: Optional[int] = None,
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    billable: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    query = db.query(models.TimeEntry).filter(models.TimeEntry.owner_id == current_user.id)
+    if project_id is not None:
+        query = query.filter(models.TimeEntry.project_id == project_id)
+    if status:
+        query = query.filter(models.TimeEntry.status == status)
+    if date_from:
+        query = query.filter(models.TimeEntry.work_date >= date_from)
+    if date_to:
+        query = query.filter(models.TimeEntry.work_date <= date_to)
+    if billable is not None:
+        query = query.filter(models.TimeEntry.billable == billable)
+
+    entries = query.order_by(
+        models.TimeEntry.work_date.desc(),
+        models.TimeEntry.id.desc(),
+    ).all()
+    return [_btt_response(e, db) for e in entries]
+
+
+@app.get("/api/time-entries/week")
+def get_time_entries_week(
+    week_start: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return a Monday-anchored 7-day grid of the user's entries (PRD 5.2 / 10.2).
+
+    `week_start` must be an ISO Monday (YYYY-MM-DD) or BTT_E008 is raised. The
+    response shape is frozen: `{week_start, days:[{date, total_minutes, entries}]}`
+    with exactly 7 ascending days. `total_minutes` sums non-rejected entries only
+    (PRD 0.8). This endpoint is registered before `/{entry_id}` so the literal
+    path is not captured as a dynamic id.
+    """
+    monday = _btt_parse_iso_monday(week_start)
+
+    days = []
+    for offset in range(7):
+        day = monday + timedelta(days=offset)
+        day_iso = day.isoformat()
+        day_entries = db.query(models.TimeEntry).filter(
+            models.TimeEntry.owner_id == current_user.id,
+            models.TimeEntry.work_date == day_iso,
+        ).order_by(models.TimeEntry.id.desc()).all()
+
+        total_minutes = sum(
+            e.duration_minutes for e in day_entries
+            if e.status != models.TimeEntryStatus.REJECTED.value
+        )
+        days.append({
+            "date": day_iso,
+            "total_minutes": total_minutes,
+            "entries": [_btt_response(e, db) for e in day_entries],
+        })
+
+    import logging
+    logging.info("btt_week_load owner=%s week_start=%s", current_user.id, week_start)
+
+    return {"week_start": monday.isoformat(), "days": days}
+
+
+@app.get("/api/time-entries/stats/summary", response_model=schemas.TimeEntryStatsSummary)
+def get_time_entries_stats_summary(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Billable-time dashboard metrics for the current user (PRD 5.3.9 / 9).
+
+    Returns:
+        - ``week_approved_unwritten_minutes``: minutes of ``approved`` (still
+          un-written-off) entries dated Monday..today of the current week.
+        - ``month_written_off_amount_cents``: integer-cents total written off
+          during the current calendar month (by ``written_off_at``).
+
+    Registered before ``/{entry_id}`` so the literal path is not captured as a
+    dynamic id.
+    """
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())  # weekday(): Monday == 0
+    month_start = today.replace(day=1)
+
+    # Metric A: approved, not yet written off, dated this week (Mon..today).
+    approved_rows = db.query(models.TimeEntry).filter(
+        models.TimeEntry.owner_id == current_user.id,
+        models.TimeEntry.status == models.TimeEntryStatus.APPROVED.value,
+        models.TimeEntry.work_date >= monday.isoformat(),
+        models.TimeEntry.work_date <= today.isoformat(),
+    ).all()
+    week_approved_unwritten_minutes = sum(r.duration_minutes for r in approved_rows)
+
+    # Metric B: written-off amount (cents) this month, by write-off timestamp.
+    written_rows = db.query(models.TimeEntry).filter(
+        models.TimeEntry.owner_id == current_user.id,
+        models.TimeEntry.status == models.TimeEntryStatus.WRITTEN_OFF.value,
+        models.TimeEntry.written_off_at >= datetime(month_start.year, month_start.month, 1),
+    ).all()
+    month_written_off_amount_cents = sum((_btt_amount_cents(r) or 0) for r in written_rows)
+
+    return schemas.TimeEntryStatsSummary(
+        week_approved_unwritten_minutes=week_approved_unwritten_minutes,
+        month_written_off_amount_cents=month_written_off_amount_cents,
+    )
+
+
+@app.get("/api/time-entries/{entry_id}", response_model=schemas.TimeEntryResponse)
+def get_time_entry(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    entry = _btt_get_owned_entry(entry_id, db, current_user)
+    return _btt_response(entry, db)
+
+
+@app.put("/api/time-entries/{entry_id}", response_model=schemas.TimeEntryResponse)
+def update_time_entry(
+    entry_id: int,
+    payload: schemas.TimeEntryUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    entry = _btt_get_owned_entry(entry_id, db, current_user)
+    update_data = payload.model_dump(exclude_unset=True)
+
+    # Only draft entries may edit content/time/date/rate fields (PRD 4.3).
+    if any(field in update_data for field in BTT_EDITABLE_FIELDS):
+        if entry.status != models.TimeEntryStatus.DRAFT.value:
+            raise _btt_error(409, "BTT_E004", "Only draft entries can be edited")
+
+    if "duration_minutes" in update_data:
+        _btt_validate_duration(update_data["duration_minutes"])
+    if "description" in update_data:
+        update_data["description"] = _btt_validate_description(update_data["description"])
+    if "project_id" in update_data:
+        _btt_get_owned_project(update_data["project_id"], db, current_user)
+    if "hourly_rate_cents" in update_data and update_data["hourly_rate_cents"] is not None:
+        if update_data["hourly_rate_cents"] < 0:
+            raise _btt_error(422, "BTT_E007", "hourly_rate_cents must be >= 0")
+
+    # Re-check the daily cap using the resulting date + duration.
+    next_date = update_data.get("work_date", entry.work_date)
+    next_minutes = update_data.get("duration_minutes", entry.duration_minutes)
+    _btt_assert_daily_cap(db, current_user, next_date, next_minutes, exclude_id=entry.id)
+
+    for key, value in update_data.items():
+        setattr(entry, key, value)
+    db.commit()
+    db.refresh(entry)
+    return _btt_response(entry, db)
+
+
+@app.delete("/api/time-entries/{entry_id}")
+def delete_time_entry(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    entry = _btt_get_owned_entry(entry_id, db, current_user)
+    # Only draft / rejected entries may be deleted (PRD 4.3).
+    if entry.status not in (models.TimeEntryStatus.DRAFT.value, models.TimeEntryStatus.REJECTED.value):
+        raise _btt_error(409, "BTT_E003", "Only draft or rejected entries can be deleted")
+    db.delete(entry)
+    db.commit()
+    return {"message": "Time entry deleted successfully"}
+
+
+@app.post("/api/time-entries/{entry_id}/transition", response_model=schemas.TimeEntryResponse)
+def transition_time_entry(
+    entry_id: int,
+    payload: schemas.TimeEntryTransition,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    entry = _btt_get_owned_entry(entry_id, db, current_user)
+    to_status = payload.to_status.value
+
+    # write_off is reached only via the dedicated endpoint (PRD 4.1 / 5.1.6).
+    if to_status == models.TimeEntryStatus.WRITTEN_OFF.value:
+        raise _btt_error(409, "BTT_E003", "Use the write-off endpoint to reach written_off")
+
+    if (entry.status, to_status) not in BTT_LEGAL_TRANSITIONS:
+        raise _btt_error(409, "BTT_E003", f"Illegal transition {entry.status} -> {to_status}")
+
+    entry.status = to_status
+    if to_status == models.TimeEntryStatus.REJECTED.value:
+        entry.reject_reason = payload.reject_reason
+    elif to_status == models.TimeEntryStatus.DRAFT.value:
+        entry.reject_reason = None
+
+    db.commit()
+    db.refresh(entry)
+
+    import logging
+    logging.info("btt_transition id=%s to=%s", entry.id, to_status)
+
+    return _btt_response(entry, db)
+
+
+@app.post("/api/time-entries/{entry_id}/write-off", response_model=schemas.TimeEntryResponse)
+def write_off_time_entry(
+    entry_id: int,
+    payload: schemas.TimeEntryWriteOff,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Write off an approved billable entry to an invoice (PRD chapter 8, M3).
+
+    Preconditions: status == ``approved``, ``billable`` is true, and
+    ``hourly_rate_cents`` > 0 (else BTT_E005 / BTT_E007). Idempotency: a
+    ``written_off`` entry cannot be written off again (BTT_E003). On success a
+    new invoice line item is appended, the invoice totals are recomputed, and
+    the entry becomes ``written_off`` with ``invoice_id`` + ``written_off_at``
+    recorded.
+    """
+    entry = _btt_get_owned_entry(entry_id, db, current_user)
+
+    # Idempotency: written_off is terminal (PRD 8.4).
+    if entry.status == models.TimeEntryStatus.WRITTEN_OFF.value:
+        raise _btt_error(409, "BTT_E003", "Entry already written off")
+
+    # Preconditions (PRD 8.1).
+    if entry.status != models.TimeEntryStatus.APPROVED.value or not entry.billable:
+        raise _btt_error(409, "BTT_E005", "Only approved billable entries can be written off")
+    if entry.hourly_rate_cents is None or entry.hourly_rate_cents <= 0:
+        raise _btt_error(422, "BTT_E007", "A positive hourly_rate_cents is required to write off")
+
+    # Invoice must belong to the current user (PRD 8.3.1).
+    invoice = db.query(models.Invoice).filter(
+        models.Invoice.id == payload.invoice_id,
+        models.Invoice.owner_id == current_user.id,
+    ).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # Integer-only amount (PRD 8.2).
+    amount_cents = (entry.duration_minutes * entry.hourly_rate_cents) // 60
+
+    # Append an invoice line item (PRD 8.3.2). Description template is frozen:
+    # "BTT#{id} {work_date} · {description truncated to 80 chars}".
+    truncated = (entry.description or "")[:80]
+    line_description = f"BTT#{entry.id} {entry.work_date} · {truncated}"
+    max_position = db.query(func.max(models.InvoiceItem.position)).filter(
+        models.InvoiceItem.invoice_id == invoice.id
+    ).scalar()
+    max_position = max_position if max_position is not None else -1
+
+    # Existing invoices store money as float dollars; convert cents -> dollars
+    # for the invoice side while the TimeEntry stays in cents (PRD 8.3.2).
+    dollars = amount_cents / 100
+    db_item = models.InvoiceItem(
+        invoice_id=invoice.id,
+        description=line_description,
+        quantity=1,
+        unit_price=dollars,
+        amount=dollars,
+        position=max_position + 1,
+    )
+    db.add(db_item)
+    db.commit()
+
+    # Recompute invoice totals with the shared helper.
+    _calculate_invoice_totals(invoice, db)
+
+    # Flip the entry to written_off and record linkage (PRD 8.3.3).
+    entry.status = models.TimeEntryStatus.WRITTEN_OFF.value
+    entry.invoice_id = invoice.id
+    entry.written_off_at = datetime.utcnow()
+    db.commit()
+    db.refresh(entry)
+
+    import logging
+    logging.info("btt_writeoff_success id=%s invoice=%s cents=%s", entry.id, invoice.id, amount_cents)
+    log_activity(db, current_user.id, "wrote off", "time_entry", f"Entry #{entry.id}", f"${dollars:.2f}")
+
+    return _btt_response(entry, db)
+
+# ==================== DASHBOARD ROUTES ====================
 @app.get("/api/dashboard", response_model=schemas.DashboardStats)
 def get_dashboard_stats(
     db: Session = Depends(get_db),
