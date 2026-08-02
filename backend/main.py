@@ -1,12 +1,15 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime, timedelta
-from typing import List
+from datetime import datetime, timedelta, date
+from typing import List, Optional
 import random
+import logging
+
+logger = logging.getLogger("btt")
 
 from database import engine, get_db, Base
 from config import settings
@@ -913,6 +916,528 @@ def delete_invoice_item(
     _calculate_invoice_totals(invoice, db)
 
     return {"message": "Item deleted successfully"}
+
+# ==================== BTT (Billable Time Tracking) ROUTES ====================
+
+BTT_MAX_MINUTES_PER_DAY = 24 * 60  # 1440
+
+BTT_TRANSITIONS = {
+    models.TimeEntryStatus.DRAFT: {models.TimeEntryStatus.SUBMITTED},
+    models.TimeEntryStatus.SUBMITTED: {models.TimeEntryStatus.APPROVED, models.TimeEntryStatus.REJECTED},
+    models.TimeEntryStatus.REJECTED: {models.TimeEntryStatus.DRAFT},
+    models.TimeEntryStatus.APPROVED: set(),
+    models.TimeEntryStatus.WRITTEN_OFF: set(),
+}
+
+
+def btt_error(code: str, message: str, http_status: int = 400) -> HTTPException:
+    """Build a BTT error HTTPException with a structured detail payload.
+
+    Args:
+        code: Frozen error code literal (e.g. ``BTT_E002``).
+        message: Human-readable explanation of the failure.
+        http_status: HTTP status code to return.
+
+    Returns:
+        HTTPException whose ``detail`` is ``{"code": ..., "message": ...}``.
+    """
+    return HTTPException(
+        status_code=http_status,
+        detail={"code": code, "message": f"{code}: {message}"},
+    )
+
+
+def compute_amount_cents(entry: models.TimeEntry) -> Optional[int]:
+    """Compute the derived billable amount using integer arithmetic.
+
+    Formula (PRD 3.2 / 8.2): ``(duration_minutes * hourly_rate_cents) // 60``.
+    Returns ``None`` when the entry is not billable or has no rate.
+
+    Args:
+        entry: The TimeEntry ORM instance.
+
+    Returns:
+        Amount in whole cents, or ``None``.
+    """
+    if not entry.billable or entry.hourly_rate_cents is None:
+        return None
+    return (entry.duration_minutes * entry.hourly_rate_cents) // 60
+
+
+def _entry_response(entry: models.TimeEntry, db: Session) -> schemas.TimeEntryResponse:
+    """Serialize a TimeEntry ORM row into its API response schema.
+
+    Args:
+        entry: The TimeEntry ORM instance.
+        db: Active database session.
+
+    Returns:
+        TimeEntryResponse with ``project_name`` and derived ``amount_cents`` populated.
+    """
+    project = db.query(models.Project).filter(models.Project.id == entry.project_id).first()
+    data = {k: v for k, v in entry.__dict__.items() if not k.startswith("_")}
+    data["project_name"] = project.name if project else None
+    data["amount_cents"] = compute_amount_cents(entry)
+    return schemas.TimeEntryResponse(**data)
+
+
+def _get_owned_entry(entry_id: int, user_id: int, db: Session) -> models.TimeEntry:
+    """Fetch a TimeEntry ensuring it belongs to the given owner.
+
+    Args:
+        entry_id: Primary key of the entry.
+        user_id: The authenticated user's id.
+        db: Active database session.
+
+    Returns:
+        The owned TimeEntry.
+
+    Raises:
+        HTTPException: 404 when the entry does not exist or is not owned.
+    """
+    entry = db.query(models.TimeEntry).filter(
+        models.TimeEntry.id == entry_id,
+        models.TimeEntry.owner_id == user_id,
+    ).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Time entry not found")
+    return entry
+
+
+def _validate_project_belongs_to_user(project_id: int, user_id: int, db: Session) -> models.Project:
+    """Validate that a project exists and belongs to the user.
+
+    Args:
+        project_id: Project primary key.
+        user_id: The authenticated user's id.
+        db: Active database session.
+
+    Returns:
+        The owned Project.
+
+    Raises:
+        HTTPException: BTT_E006 when the project is missing or not owned.
+    """
+    project = db.query(models.Project).filter(
+        models.Project.id == project_id,
+        models.Project.owner_id == user_id,
+    ).first()
+    if not project:
+        raise btt_error("BTT_E006", "Project does not exist or does not belong to the current user", 400)
+    return project
+
+
+def _validate_duration(duration_minutes: int) -> None:
+    """Validate that a duration is a positive integer.
+
+    Args:
+        duration_minutes: Candidate duration.
+
+    Raises:
+        HTTPException: BTT_E001 when duration is not a positive integer.
+    """
+    if not isinstance(duration_minutes, int) or isinstance(duration_minutes, bool) or duration_minutes <= 0:
+        raise btt_error("BTT_E001", "duration_minutes must be a positive integer", 400)
+
+
+def _check_daily_limit(
+    db: Session,
+    user_id: int,
+    work_date: date,
+    duration_minutes: int,
+    exclude_entry_id: Optional[int] = None,
+) -> None:
+    """Enforce the per-owner, per-day 1440-minute cap (excluding rejected entries).
+
+    Args:
+        db: Active database session.
+        user_id: The authenticated user's id.
+        work_date: The calendar day being checked.
+        duration_minutes: The new/updated duration to add.
+        exclude_entry_id: Entry id to exclude from the sum (used on update).
+
+    Raises:
+        HTTPException: BTT_E002 when the cap would be exceeded.
+    """
+    query = db.query(func.coalesce(func.sum(models.TimeEntry.duration_minutes), 0)).filter(
+        models.TimeEntry.owner_id == user_id,
+        models.TimeEntry.work_date == work_date,
+        models.TimeEntry.status != models.TimeEntryStatus.REJECTED,
+    )
+    if exclude_entry_id is not None:
+        query = query.filter(models.TimeEntry.id != exclude_entry_id)
+    existing = query.scalar() or 0
+    if existing + duration_minutes > BTT_MAX_MINUTES_PER_DAY:
+        raise btt_error(
+            "BTT_E002",
+            f"Daily limit of {BTT_MAX_MINUTES_PER_DAY} minutes exceeded",
+            400,
+        )
+
+
+btt_router = APIRouter(prefix="/api/time-entries", tags=["time-entries"])
+
+
+@btt_router.post("", response_model=schemas.TimeEntryResponse, status_code=201)
+def create_time_entry(
+    payload: schemas.TimeEntryCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Create a new draft time entry for the current user."""
+    _validate_duration(payload.duration_minutes)
+    _validate_project_belongs_to_user(payload.project_id, current_user.id, db)
+
+    description = payload.description.strip()
+    if len(description) > schemas.BTT_DESC_MAX:
+        raise btt_error("BTT_E001", f"description must be at most {schemas.BTT_DESC_MAX} characters", 400)
+
+    _check_daily_limit(db, current_user.id, payload.work_date, payload.duration_minutes)
+
+    entry = models.TimeEntry(
+        owner_id=current_user.id,
+        project_id=payload.project_id,
+        work_date=payload.work_date,
+        duration_minutes=payload.duration_minutes,
+        description=description,
+        billable=payload.billable if payload.billable is not None else True,
+        hourly_rate_cents=payload.hourly_rate_cents,
+        status=models.TimeEntryStatus.DRAFT,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    logger.info("btt_entry_created user=%s entry=%s", current_user.id, entry.id)
+    log_activity(db, current_user.id, "created", "time_entry", f"BTT#{entry.id}")
+
+    return _entry_response(entry, db)
+
+
+@btt_router.get("", response_model=List[schemas.TimeEntryResponse])
+def list_time_entries(
+    project_id: Optional[int] = None,
+    status_filter: Optional[models.TimeEntryStatus] = Query(default=None, alias="status"),
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    billable: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """List the current user's time entries with optional filters, newest work date first."""
+    query = db.query(models.TimeEntry).filter(models.TimeEntry.owner_id == current_user.id)
+
+    if project_id is not None:
+        query = query.filter(models.TimeEntry.project_id == project_id)
+    if status_filter is not None:
+        query = query.filter(models.TimeEntry.status == status_filter)
+    if date_from is not None:
+        query = query.filter(models.TimeEntry.work_date >= date_from)
+    if date_to is not None:
+        query = query.filter(models.TimeEntry.work_date <= date_to)
+    if billable is not None:
+        query = query.filter(models.TimeEntry.billable == billable)
+
+    entries = query.order_by(
+        models.TimeEntry.work_date.desc(),
+        models.TimeEntry.id.desc(),
+    ).all()
+    return [_entry_response(e, db) for e in entries]
+
+
+@btt_router.get("/week", response_model=schemas.TimeEntryWeekResponse)
+def get_week(
+    week_start: date = Query(..., description="ISO Monday (YYYY-MM-DD) that starts the week"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return seven day buckets for the week starting at ``week_start`` (ISO Monday).
+
+    ``days`` always contains exactly 7 elements in ascending date order (PRD 10.2).
+    A non-Monday ``week_start`` is rejected with BTT_E008 (PRD 5.2 / 0.9).
+    """
+    if week_start.weekday() != 0:
+        raise btt_error(
+            "BTT_E008",
+            "week_start must be an ISO Monday (YYYY-MM-DD)",
+            400,
+        )
+
+    week_end = week_start + timedelta(days=6)
+    entries = (
+        db.query(models.TimeEntry)
+        .filter(
+            models.TimeEntry.owner_id == current_user.id,
+            models.TimeEntry.work_date >= week_start,
+            models.TimeEntry.work_date <= week_end,
+        )
+        .order_by(models.TimeEntry.work_date.asc(), models.TimeEntry.id.asc())
+        .all()
+    )
+
+    by_date = {}
+    for entry in entries:
+        by_date.setdefault(entry.work_date, []).append(entry)
+
+    days = []
+    for offset in range(7):
+        day = week_start + timedelta(days=offset)
+        day_entries = by_date.get(day, [])
+        total = sum(e.duration_minutes for e in day_entries)
+        days.append(
+            schemas.TimeEntryWeekDay(
+                date=day,
+                total_minutes=total,
+                entries=[_entry_response(e, db) for e in day_entries],
+            )
+        )
+
+    return schemas.TimeEntryWeekResponse(week_start=week_start, days=days)
+
+
+@btt_router.get("/stats/summary", response_model=schemas.TimeEntryStatsSummary)
+def get_stats_summary(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return BTT summary metrics for the Dashboard (PRD 5.3 / 9).
+
+    - ``week_approved_unwritten_minutes``: minutes approved but not yet written
+      off, counted from this week's Monday (inclusive) through today.
+    - ``month_written_off_amount_cents``: sum of ``amount_cents`` for entries
+      written off during the current calendar month (integer cents).
+    """
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+
+    week_minutes = (
+        db.query(func.coalesce(func.sum(models.TimeEntry.duration_minutes), 0))
+        .filter(
+            models.TimeEntry.owner_id == current_user.id,
+            models.TimeEntry.status == models.TimeEntryStatus.APPROVED,
+            models.TimeEntry.invoice_id.is_(None),
+            models.TimeEntry.work_date >= week_start,
+            models.TimeEntry.work_date <= today,
+        )
+        .scalar()
+    ) or 0
+
+    month_start = today.replace(day=1)
+    written_entries = (
+        db.query(models.TimeEntry)
+        .filter(
+            models.TimeEntry.owner_id == current_user.id,
+            models.TimeEntry.status == models.TimeEntryStatus.WRITTEN_OFF,
+            models.TimeEntry.written_off_at >= datetime.combine(month_start, datetime.min.time()),
+        )
+        .all()
+    )
+    month_amount = sum(compute_amount_cents(e) or 0 for e in written_entries)
+
+    return schemas.TimeEntryStatsSummary(
+        week_approved_unwritten_minutes=int(week_minutes),
+        month_written_off_amount_cents=int(month_amount),
+    )
+
+
+@btt_router.get("/{entry_id}", response_model=schemas.TimeEntryResponse)
+def get_time_entry(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Fetch a single time entry by id."""
+    entry = _get_owned_entry(entry_id, current_user.id, db)
+    return _entry_response(entry, db)
+
+
+@btt_router.put("/{entry_id}", response_model=schemas.TimeEntryResponse)
+def update_time_entry(
+    entry_id: int,
+    payload: schemas.TimeEntryUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Update an editable time entry. Only draft entries may be modified."""
+    entry = _get_owned_entry(entry_id, current_user.id, db)
+
+    if entry.status != models.TimeEntryStatus.DRAFT:
+        raise btt_error("BTT_E004", "Only draft entries can be edited", 409)
+
+    data = payload.model_dump(exclude_unset=True)
+
+    if "project_id" in data and data["project_id"] is not None:
+        _validate_project_belongs_to_user(data["project_id"], current_user.id, db)
+
+    if "duration_minutes" in data and data["duration_minutes"] is not None:
+        _validate_duration(data["duration_minutes"])
+
+    if "description" in data and data["description"] is not None:
+        description = data["description"].strip()
+        if not description:
+            raise btt_error("BTT_E001", "description must not be blank", 400)
+        if len(description) > schemas.BTT_DESC_MAX:
+            raise btt_error("BTT_E001", f"description must be at most {schemas.BTT_DESC_MAX} characters", 400)
+        data["description"] = description
+
+    effective_date = data.get("work_date", entry.work_date)
+    effective_duration = data.get("duration_minutes", entry.duration_minutes)
+    if "duration_minutes" in data or "work_date" in data:
+        _check_daily_limit(
+            db, current_user.id, effective_date, effective_duration, exclude_entry_id=entry.id
+        )
+
+    for key, value in data.items():
+        setattr(entry, key, value)
+
+    db.commit()
+    db.refresh(entry)
+    return _entry_response(entry, db)
+
+
+@btt_router.delete("/{entry_id}")
+def delete_time_entry(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Delete a draft or rejected time entry."""
+    entry = _get_owned_entry(entry_id, current_user.id, db)
+
+    if entry.status not in (models.TimeEntryStatus.DRAFT, models.TimeEntryStatus.REJECTED):
+        raise btt_error("BTT_E003", "Only draft or rejected entries can be deleted", 409)
+
+    db.delete(entry)
+    db.commit()
+    return {"message": "Time entry deleted successfully"}
+
+
+@btt_router.post("/{entry_id}/transition", response_model=schemas.TimeEntryResponse)
+def transition_time_entry(
+    entry_id: int,
+    payload: schemas.TimeEntryTransition,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Execute a state-machine transition (submit/approve/reject/revise)."""
+    entry = _get_owned_entry(entry_id, current_user.id, db)
+
+    to_status = payload.to_status
+    if to_status == models.TimeEntryStatus.WRITTEN_OFF:
+        raise btt_error("BTT_E003", "written_off is only reachable via the write-off endpoint", 400)
+
+    allowed = BTT_TRANSITIONS.get(entry.status, set())
+    if to_status not in allowed:
+        raise btt_error(
+            "BTT_E003",
+            f"Illegal transition from '{entry.status.value}' to '{to_status.value}'",
+            409,
+        )
+
+    entry.status = to_status
+
+    if to_status == models.TimeEntryStatus.REJECTED:
+        entry.reject_reason = payload.reject_reason.strip() if payload.reject_reason else None
+    elif to_status == models.TimeEntryStatus.DRAFT:
+        entry.reject_reason = None
+
+    db.commit()
+    db.refresh(entry)
+
+    logger.info(
+        "btt_transition user=%s entry=%s to=%s",
+        current_user.id, entry.id, to_status.value,
+    )
+    log_activity(db, current_user.id, "transitioned", "time_entry", f"BTT#{entry.id} → {to_status.value}")
+
+    return _entry_response(entry, db)
+
+
+@btt_router.post("/{entry_id}/write-off", response_model=schemas.TimeEntryResponse)
+def write_off_time_entry(
+    entry_id: int,
+    payload: schemas.TimeEntryWriteOff,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Write an approved billable time entry off onto an invoice line item (PRD 8).
+
+    - Preconditions: status=approved, billable=true, hourly_rate_cents > 0.
+    - Adds an invoice line item with description ``BTT#{id} {work_date} · {desc<80}``.
+    - Sets status=written_off, invoice_id and written_off_at.
+    - Repeating this on an already written-off entry fails with BTT_E003 (idempotent guard).
+    """
+    entry = _get_owned_entry(entry_id, current_user.id, db)
+
+    if entry.status == models.TimeEntryStatus.WRITTEN_OFF:
+        raise btt_error("BTT_E003", "Time entry is already written off", 409)
+
+    if entry.status != models.TimeEntryStatus.APPROVED or not entry.billable:
+        raise btt_error(
+            "BTT_E005",
+            "Only approved, billable time entries can be written off",
+            400,
+        )
+
+    if entry.hourly_rate_cents is None or entry.hourly_rate_cents <= 0:
+        raise btt_error(
+            "BTT_E007",
+            "A valid hourly_rate_cents (> 0) is required to write off",
+            400,
+        )
+
+    invoice = db.query(models.Invoice).filter(
+        models.Invoice.id == payload.invoice_id,
+        models.Invoice.owner_id == current_user.id,
+    ).first()
+    if not invoice:
+        raise btt_error("BTT_E006", "Invoice does not exist or does not belong to the current user", 400)
+
+    amount_cents = compute_amount_cents(entry)
+    amount_dollars = round(amount_cents / 100, 2)
+
+    description_truncated = entry.description[:80]
+    line_description = f"BTT#{entry.id} {entry.work_date.isoformat()} · {description_truncated}"
+
+    max_position = db.query(func.max(models.InvoiceItem.position)).filter(
+        models.InvoiceItem.invoice_id == invoice.id
+    ).scalar()
+    position = (max_position + 1) if max_position is not None else 0
+
+    item = models.InvoiceItem(
+        invoice_id=invoice.id,
+        description=line_description,
+        quantity=1,
+        unit_price=amount_dollars,
+        amount=amount_dollars,
+        position=position,
+    )
+    db.add(item)
+
+    entry.status = models.TimeEntryStatus.WRITTEN_OFF
+    entry.invoice_id = invoice.id
+    entry.written_off_at = datetime.utcnow()
+
+    db.commit()
+
+    _calculate_invoice_totals(invoice, db)
+
+    db.refresh(entry)
+
+    logger.info("btt_writeoff_success user=%s entry=%s invoice=%s", current_user.id, entry.id, invoice.id)
+    log_activity(
+        db,
+        current_user.id,
+        "written_off",
+        "time_entry",
+        f"BTT#{entry.id} → {invoice.invoice_number}",
+    )
+
+    return _entry_response(entry, db)
+
+
+app.include_router(btt_router)
+
 
 # ==================== DASHBOARD ROUTES ====================
 
