@@ -1,7 +1,7 @@
-from pydantic import BaseModel, EmailStr
-from datetime import datetime
+from pydantic import BaseModel, EmailStr, field_validator
+from datetime import datetime, date
 from typing import Optional, List
-from models import ProjectStatus, InvoiceStatus, TaskStatus, TaskPriority, PaymentTerms
+from models import ProjectStatus, InvoiceStatus, TaskStatus, TaskPriority, PaymentTerms, TimeEntryStatus
 
 # Auth Schemas
 class UserCreate(BaseModel):
@@ -257,3 +257,115 @@ class DashboardStats(BaseModel):
     monthly_revenue: List[dict]
     project_status_distribution: List[dict]
     recent_activities: List[ActivityResponse]
+
+
+# ==================== BTT (Billable Time Tracking) Schemas ====================
+
+class TimeEntryCreate(BaseModel):
+    project_id: int
+    work_date: date
+    duration_minutes: int
+    description: str
+    billable: bool = True
+    hourly_rate_cents: Optional[int] = None
+
+    @field_validator("duration_minutes")
+    @classmethod
+    def validate_duration(cls, v):
+        if not isinstance(v, int) or v <= 0:
+            raise ValueError("BTT_E001: duration_minutes must be a positive integer")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v):
+        v = v.strip()
+        if len(v) < 1 or len(v) > 500:
+            raise ValueError("Description must be 1-500 characters after trimming")
+        return v
+
+    @field_validator("hourly_rate_cents")
+    @classmethod
+    def validate_rate(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("hourly_rate_cents must be >= 0")
+        return v
+
+
+class TimeEntryUpdate(BaseModel):
+    project_id: Optional[int] = None
+    work_date: Optional[date] = None
+    duration_minutes: Optional[int] = None
+    description: Optional[str] = None
+    billable: Optional[bool] = None
+    hourly_rate_cents: Optional[int] = None
+
+    @field_validator("duration_minutes")
+    @classmethod
+    def validate_duration(cls, v):
+        if v is not None and (not isinstance(v, int) or v <= 0):
+            raise ValueError("BTT_E001: duration_minutes must be a positive integer")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v):
+        if v is not None:
+            v = v.strip()
+            if len(v) < 1 or len(v) > 500:
+                raise ValueError("Description must be 1-500 characters after trimming")
+        return v
+
+    @field_validator("hourly_rate_cents")
+    @classmethod
+    def validate_rate(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("hourly_rate_cents must be >= 0")
+        return v
+
+
+class TimeEntryTransition(BaseModel):
+    to_status: TimeEntryStatus
+    reject_reason: Optional[str] = None
+
+
+class TimeEntryResponse(BaseModel):
+    id: int
+    owner_id: int
+    project_id: int
+    work_date: date
+    duration_minutes: int
+    description: str
+    billable: bool
+    hourly_rate_cents: Optional[int]
+    status: TimeEntryStatus
+    reject_reason: Optional[str]
+    invoice_id: Optional[int]
+    written_off_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    project_name: Optional[str] = None
+    amount_cents: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TimeEntryWeekDay(BaseModel):
+    date: date
+    total_minutes: int
+    entries: List[TimeEntryResponse]
+
+
+class TimeEntryWeekResponse(BaseModel):
+    week_start: date
+    days: List[TimeEntryWeekDay]
+
+
+class TimeEntryWriteOff(BaseModel):
+    invoice_id: int
+
+
+class TimeEntryStatsSummary(BaseModel):
+    week_approved_unwritten_minutes: int
+    month_written_off_amount_cents: int

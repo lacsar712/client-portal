@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -7,9 +8,11 @@ import {
 import {
   DollarSign, Clock, FolderKanban, Users,
   TrendingUp, TrendingDown, ArrowUpRight, Activity,
-  Zap, FileText
+  Zap, FileText, Timer
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { useBttStats } from '../hooks/useBttStats';
+import { formatCents, formatDuration } from '../utils/bttMoney';
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -26,6 +29,8 @@ const itemVariants = {
 
 export default function Dashboard() {
   const { api } = useAuth();
+  const navigate = useNavigate();
+  const { stats: bttStats, loading: bttLoading } = useBttStats();
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -146,6 +151,46 @@ export default function Dashboard() {
               );
             })}
           </div>
+
+          {/* Billable Time Card (M3) */}
+          <motion.div variants={itemVariants} style={{ marginBottom: '1.5rem' }}>
+            <div
+              className="card stat-card"
+              onClick={() => navigate('/time-entries?status=approved')}
+              style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '1.5rem', padding: '1.5rem' }}
+            >
+              <div className="stat-icon indigo" style={{ marginBottom: 0 }}>
+                <Timer size={28} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <h3 className="card-title" style={{ marginBottom: '0.75rem' }}>Billable Time</h3>
+                <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
+                  <div>
+                    <div className="stat-value" style={{ fontSize: '1.5rem', marginBottom: '0.125rem' }}>
+                      {bttLoading ? '…' : formatDuration(bttStats?.week_approved_unwritten_minutes || 0)}
+                    </div>
+                    <div className="stat-label" style={{ marginBottom: 0 }}>
+                      Approved not written-off (this week)
+                      {bttStats?.week_approved_unwritten_minutes > 0 && (
+                        <span style={{ marginLeft: '0.5rem', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                          ({(bttStats.week_approved_unwritten_minutes / 60).toFixed(2)}h)
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="stat-value" style={{ fontSize: '1.5rem', marginBottom: '0.125rem' }}>
+                      {bttLoading ? '…' : formatCents(bttStats?.month_written_off_amount_cents || 0)}
+                    </div>
+                    <div className="stat-label" style={{ marginBottom: 0 }}>
+                      Written-off amount (this month)
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <ArrowUpRight size={20} style={{ color: 'var(--text-muted)' }} />
+            </div>
+          </motion.div>
 
           {/* Charts Row */}
           <div className="grid-2" style={{ marginBottom: '1.5rem' }}>
