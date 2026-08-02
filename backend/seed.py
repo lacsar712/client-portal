@@ -84,6 +84,53 @@ def seed_database():
 
         print(f"Created {len(created_projects)} projects")
 
+        # Create sample BTT time entries (PRD Appendix D)
+        today = datetime.now().date()
+        monday = today - timedelta(days=today.weekday())
+        time_entries_data = [
+            {
+                "work_date": monday,
+                "duration_minutes": 90,
+                "description": "Initial project kickoff and requirements review",
+                "billable": True,
+                "hourly_rate_cents": 15000,
+                "status": models.TimeEntryStatus.DRAFT,
+            },
+            {
+                "work_date": monday,
+                "duration_minutes": 60,
+                "description": "Backend API scaffolding",
+                "billable": True,
+                "hourly_rate_cents": 15000,
+                "status": models.TimeEntryStatus.SUBMITTED,
+            },
+            {
+                "work_date": monday + timedelta(days=2),
+                "duration_minutes": 120,
+                "description": "Database schema design and implementation",
+                "billable": True,
+                "hourly_rate_cents": 15000,
+                "status": models.TimeEntryStatus.APPROVED,
+            },
+            {
+                "work_date": monday + timedelta(days=3),
+                "duration_minutes": 45,
+                "description": "Internal team sync (non-billable)",
+                "billable": False,
+                "hourly_rate_cents": None,
+                "status": models.TimeEntryStatus.APPROVED,
+            },
+        ]
+        for te_data in time_entries_data:
+            time_entry = models.TimeEntry(
+                **te_data,
+                owner_id=demo_user.id,
+                project_id=created_projects[0].id,
+            )
+            db.add(time_entry)
+        db.commit()
+        print(f"Created {len(time_entries_data)} time entries")
+
         # Create sample tasks for each project
         tasks_by_project = {
             "E-commerce Platform": [

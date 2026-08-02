@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -7,9 +8,11 @@ import {
 import {
   DollarSign, Clock, FolderKanban, Users,
   TrendingUp, TrendingDown, ArrowUpRight, Activity,
-  Zap, FileText
+  Zap, FileText, Timer,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { getStatsSummary } from '../services/timeEntriesApi';
+import { formatCents, formatDuration } from '../utils/bttMoney';
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -26,7 +29,9 @@ const itemVariants = {
 
 export default function Dashboard() {
   const { api } = useAuth();
+  const navigate = useNavigate();
   const [stats, setStats] = useState(null);
+  const [bttSummary, setBttSummary] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -35,8 +40,12 @@ export default function Dashboard() {
 
   const fetchDashboard = async () => {
     try {
-      const res = await api.get('/dashboard');
-      setStats(res.data);
+      const [dashRes, bttRes] = await Promise.all([
+        api.get('/dashboard'),
+        getStatsSummary().catch(() => null),
+      ]);
+      setStats(dashRes.data);
+      setBttSummary(bttRes);
     } catch (err) {
       console.error('Failed to fetch dashboard:', err);
     } finally {
@@ -146,6 +155,52 @@ export default function Dashboard() {
               );
             })}
           </div>
+
+          {/* Billable Time card (BTT M3, PRD 9) */}
+          <motion.div
+            variants={itemVariants}
+            className="card"
+            onClick={() => navigate('/time-entries?status=approved')}
+            style={{
+              marginBottom: '1.5rem',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '1.5rem',
+              flexWrap: 'wrap',
+            }}
+          >
+            <div
+              className="stat-icon emerald"
+              style={{ marginBottom: 0, width: 56, height: 56, flexShrink: 0 }}
+            >
+              <Timer size={28} />
+            </div>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <h3 className="card-title" style={{ marginBottom: '0.5rem' }}>
+                Billable Time
+              </h3>
+              <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
+                <div>
+                  <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                    {formatDuration(bttSummary?.week_approved_unwritten_minutes || 0)}
+                  </div>
+                  <div className="stat-label" style={{ marginBottom: 0 }}>
+                    Approved not written-off (this week)
+                  </div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--accent-primary)' }}>
+                    {formatCents(bttSummary?.month_written_off_amount_cents)}
+                  </div>
+                  <div className="stat-label" style={{ marginBottom: 0 }}>
+                    Written-off amount (this month)
+                  </div>
+                </div>
+              </div>
+            </div>
+            <ArrowUpRight size={20} style={{ color: 'var(--text-muted)' }} />
+          </motion.div>
 
           {/* Charts Row */}
           <div className="grid-2" style={{ marginBottom: '1.5rem' }}>
